@@ -23,6 +23,8 @@ class Config:
     bot_token: str
     admin_ids: frozenset[int]
     db_path: Path
+    database_url: str
+    """Строка подключения Postgres. Если пусто — используется SQLite из db_path."""
     default_reward: int
     """Начисление за одну продажу в копейках."""
     tz_offset_hours: int
@@ -89,6 +91,7 @@ def load_config() -> Config:
         bot_token=token,
         admin_ids=admin_ids,
         db_path=db_path,
+        database_url=os.getenv("DATABASE_URL", "").strip(),
         default_reward=default_reward,
         tz_offset_hours=tz_offset,
         platega_merchant_id=os.getenv("PLATEGA_MERCHANT_ID", "").strip(),

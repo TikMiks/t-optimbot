@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
-import os
-import threading
-import os
-import threading
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -19,6 +16,7 @@ from bot.db import Database
 from bot.handlers import build_router
 from bot.platega import PlategaClient
 from bot.poller import PlategaPoller, notify_startup_status
+from bot.web import keep_alive, start_health_server
 
 logger = logging.getLogger("promo-bot")
 
@@ -56,9 +54,17 @@ async def setup_commands(bot: Bot, admin_ids: frozenset[int]) -> None:
 async def run() -> None:
     config = load_config()
 
-    db = Database(config.db_path)
+    db = Database(config.db_path, config.database_url or None)
     await db.connect()
-    logger.info("База данных: %s", config.db_path)
+    logger.info("База данных: %s", db.describe())
+
+    # Render и похожие хостинги передают порт веб-сервиса в $PORT.
+    web_runner = None
+    port = os.getenv("PORT", "").strip()
+    if port.isdigit():
+        web_runner = await start_health_server(int(port))
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    keep_alive_task = asyncio.create_task(keep_alive(external_url)) if external_url else None
 
     bot = Bot(
         token=config.bot_token,
@@ -96,12 +102,16 @@ async def run() -> None:
     try:
         await dispatcher.start_polling(bot)
     finally:
-        if poll_task is not None:
-            poll_task.cancel()
+        for task in (poll_task, keep_alive_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await poll_task
+                await task
             except asyncio.CancelledError:
                 pass
+        if web_runner is not None:
+            await web_runner.cleanup()
         await db.close()
         await bot.session.close()
         logger.info("Бот остановлен")

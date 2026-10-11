@@ -31,6 +31,7 @@ copy .env.example .env          # Windows (cp на Linux/macOS)
 | `ADMIN_IDS`       | ваши Telegram ID через запятую (узнать — команда `/id` в боте)   |
 | `DEFAULT_REWARD`  | начисление за покупку по умолчанию, в рублях (500)               |
 | `DB_PATH`         | путь к файлу базы, по умолчанию `data/bot.db`                    |
+| `DATABASE_URL`    | строка подключения Postgres; если задана, `DB_PATH` не нужен     |
 | `TZ_OFFSET_HOURS` | часовой пояс для отображения дат (Москва — 3)                    |
 | `PLATEGA_MERCHANT_ID` | UUID мерчанта из my.platega.io → Настройки                   |
 | `PLATEGA_SECRET`  | API-ключ из того же раздела (не коммитьте)                       |
@@ -111,10 +112,28 @@ bot/platega.py           клиент API Platega
 bot/poller.py            фоновый опрос выгрузки транзакций
 ```
 
+## Хостинг на Render (бесплатно)
+
+На бесплатном Render файлы стираются при каждом перезапуске, поэтому база живёт
+в бесплатном Postgres на [Supabase](https://supabase.com), а бот работает как
+веб-сервис: отвечает на `/health` и сам пингует себя раз в 10 минут, чтобы
+Render его не усыплял.
+
+1. Supabase → New project. Затем **Connect** → **Session pooler** → скопировать
+   строку `postgresql://...` и подставить в неё пароль базы.
+2. Вписать эту строку в `.env` как `DATABASE_URL=...` и перенести данные:
+   `python -m scripts.migrate_to_postgres`.
+3. Render → **New** → **Blueprint** → выбрать этот репозиторий (`render.yaml`
+   уже в нём). Ввести секреты: `BOT_TOKEN`, `DATABASE_URL`,
+   `PLATEGA_MERCHANT_ID`, `PLATEGA_SECRET`.
+4. Бот должен работать только в одном месте: локальный запуск при этом
+   останавливайте, иначе Telegram выдаст конфликт.
+
 ## Данные и бэкап
 
-Вся информация лежит в одном файле SQLite (`data/bot.db`). Для бэкапа достаточно
-скопировать его вместе с `data/bot.db-wal`, остановив бота.
+Без `DATABASE_URL` вся информация лежит в одном файле SQLite (`data/bot.db`).
+Для бэкапа достаточно скопировать его вместе с `data/bot.db-wal`, остановив бота.
+С Postgres бэкапы делаются в панели Supabase.
 
 Денежные суммы хранятся в копейках целым числом — округлений не возникает.
 

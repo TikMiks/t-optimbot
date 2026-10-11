@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: t-optim-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      # Секреты вводятся в панели Render при создании сервиса.
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PLATEGA_MERCHANT_ID
+        sync: false
+      - key: PLATEGA_SECRET
+        sync: false
+      - key: ADMIN_IDS
+        value: 6134902274,1025520083,7648033650
+      - key: DEFAULT_REWARD
+        value: "500"
+      - key: TZ_OFFSET_HOURS
+        value: "3"
+      - key: PLATEGA_BASE_URL
+        value: https://app.platega.io
+      - key: PLATEGA_POLL_INTERVAL
+        value: "60"
+      - key: PLATEGA_LOOKBACK_HOURS
+        value: "720"

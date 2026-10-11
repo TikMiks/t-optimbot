@@ -7,11 +7,10 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-import aiosqlite
 from aiogram import Bot
 
 from bot.config import Config
-from bot.db import Database, PaymentRecord, Promo
+from bot.db import Database, IntegrityError, PaymentRecord, Promo
 from bot.notifications import notify_admin_sale, notify_admins, notify_chargeback, notify_sale
 from bot.platega import (
     INTERESTING_STATUSES,
@@ -181,7 +180,7 @@ class PlategaPoller:
                 external_id=payment.transaction_id,
                 created_at=payment.created_at,
             )
-        except aiosqlite.IntegrityError:
+        except IntegrityError:
             result.skipped += 1
             return
         await self.db.mark_payment_processed(
