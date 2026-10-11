@@ -7,7 +7,21 @@ import os
 import threading
 import os
 import threading
+from flask import Flask
 
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is active!"
+
+def run_flask():
+    # Считываем порт, который сгенерировала AlwaysData, или 8100 по умолчанию
+    port = int(os.environ.get("PORT", 8100))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+# Запуск в фоновом потоке
+threading.Thread(target=run_flask, daemon=True).start()
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
