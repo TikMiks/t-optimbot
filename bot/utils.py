@@ -22,7 +22,7 @@ def new_token() -> str:
 
 def normalize_code(raw: str) -> str:
     """Приводит промокод к каноническому виду или бросает ValueError."""
-    code = raw.strip().lstrip("#").upper()
+    code = raw.strip().lstrip("#@").upper()
     if not CODE_RE.match(code):
         raise ValueError(
             "Промокод должен быть от 2 до 32 символов: буквы, цифры, дефис или подчёркивание."

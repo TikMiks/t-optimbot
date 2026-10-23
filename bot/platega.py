@@ -24,14 +24,27 @@ STATUS_CONFIRMED = "CONFIRMED"
 STATUS_CANCELED = "CANCELED"
 STATUS_CHARGEBACKED = "CHARGEBACKED"
 
-INTERESTING_STATUSES = frozenset({STATUS_CONFIRMED, STATUS_CHARGEBACKED})
+# Кабинет иногда пишет возврат не как CHARGEBACKED.
+_STATUS_ALIASES = {
+    "CHARGEBACK": STATUS_CHARGEBACKED,
+    "REFUNDED": STATUS_CHARGEBACKED,
+    "REFUND": STATUS_CHARGEBACKED,
+    "CANCELLED": STATUS_CANCELED,
+}
+
+INTERESTING_STATUSES = frozenset({STATUS_CONFIRMED, STATUS_CHARGEBACKED, STATUS_CANCELED})
 
 _PROMO_JSON_KEYS = ("promo", "promocode", "promo_code", "code", "coupon")
 _KV_RE = re.compile(r"(?:promo(?:code)?|code)\s*[=:]\s*([^\s;|,]+)", re.IGNORECASE)
 _PHRASE_RE = re.compile(r"по\s+промокоду\s+([^\s.,;:]+)", re.IGNORECASE)
 _CODE_TOKEN_RE = re.compile(r"[\w\-]{2,32}", re.UNICODE)
-_BUYER_RE = re.compile(
-    r"(?:TG:|Telegram:\s*)@*([A-Za-z0-9_]{3,32})",
+_LABELED_BUYER_RE = re.compile(
+    r"(?:TG|Telegram)\s*:\s*@*([A-Za-z0-9_]{3,32})",
+    re.IGNORECASE,
+)
+_AT_BUYER_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{5,32})")
+_HANDLE_SPAN_RE = re.compile(
+    r"(?:(?:TG|Telegram)\s*:\s*@*[A-Za-z0-9_]{3,32})|(?<![\w@])@[A-Za-z0-9_]{5,32}",
     re.IGNORECASE,
 )
 
@@ -104,15 +117,31 @@ def _candidate_from_text(text: str) -> str | None:
     return None
 
 
+def canonical_status(raw: str) -> str:
+    status = str(raw or "").strip().upper()
+    return _STATUS_ALIASES.get(status, status)
+
+
 def extract_buyer_username(payload: str | None, description: str | None = None) -> str | None:
-    """Достаёт Telegram-ник покупателя из payload (`TG:nick`) или описания."""
+    """Достаёт Telegram-ник: `TG:nick`, `TG:@nick`, `Telegram: @nick` или `@nick`."""
     for raw in (payload, description):
         if not raw:
             continue
-        match = _BUYER_RE.search(str(raw))
+        match = _LABELED_BUYER_RE.search(str(raw))
+        if match:
+            return match.group(1)
+    for raw in (payload, description):
+        if not raw:
+            continue
+        match = _AT_BUYER_RE.search(str(raw))
         if match:
             return match.group(1)
     return None
+
+
+def without_telegram_handles(text: str) -> str:
+    """Убирает юзернейм покупателя, чтобы он не склеился с промокодом."""
+    return _HANDLE_SPAN_RE.sub(" ", text)
 
 
 def extract_promo_hint(payload: str | None, description: str | None = None) -> str | None:
@@ -121,10 +150,10 @@ def extract_promo_hint(payload: str | None, description: str | None = None) -> s
     На t-optim.cc сайт кладёт в payload Telegram покупателя (`TG:nick`),
     а промокод — в описание: «по промокоду MELL».
     """
-    for raw in (payload, description):
-        if not raw:
+    texts = [str(raw).strip() for raw in (payload, description) if raw]
+    for text in texts:
+        if _LABELED_BUYER_RE.fullmatch(text):
             continue
-        text = str(raw).strip()
         phrase = _PHRASE_RE.search(text)
         if phrase:
             try:
@@ -144,12 +173,22 @@ def extract_promo_hint(payload: str | None, description: str | None = None) -> s
                             return normalize_code(str(value))
                         except ValueError:
                             continue
-        # Голый промокод — только если строка целиком им и является.
-        # «TG:username» и длинное описание сюда не попадают.
-        if " " not in text and ":" not in text:
-            hint = _candidate_from_text(text)
-            if hint:
-                return hint
+    # Голый промокод — только если строка целиком им и является.
+    # Сначала обычный код, потом строка вида @nick: иначе ник в payload
+    # затирает промокод из описания.
+    plain: list[str] = []
+    handles: list[str] = []
+    for text in texts:
+        if _LABELED_BUYER_RE.fullmatch(text) or " " in text or ":" in text:
+            continue
+        if _AT_BUYER_RE.fullmatch(text):
+            handles.append(text)
+        else:
+            plain.append(text)
+    for text in plain + handles:
+        hint = _candidate_from_text(text)
+        if hint:
+            return hint
     return None
 
 
@@ -157,7 +196,7 @@ def match_known_promo(texts: list[str], known_codes: list[str]) -> str | None:
     """Ищет известный промокод внутри произвольного текста (длинные коды первыми)."""
     if not known_codes:
         return None
-    blob = " ".join(part for part in texts if part).upper()
+    blob = " ".join(without_telegram_handles(part) for part in texts if part).upper()
     if not blob:
         return None
     tokens = set(_CODE_TOKEN_RE.findall(blob))
@@ -221,6 +260,29 @@ class PlategaClient:
             if own_session:
                 await session.close()
 
+    async def get_transaction(self, transaction_id: str) -> PlategaTransaction | None:
+        """GET /transaction/{id}. None, если транзакции уже нет."""
+        try:
+            data = await self._request("GET", f"/transaction/{transaction_id}")
+        except PlategaError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        if not isinstance(data, dict):
+            return None
+        details = data.get("paymentDetails") if isinstance(data.get("paymentDetails"), dict) else {}
+        row = {
+            "id": data.get("id") or transaction_id,
+            "status": data.get("status"),
+            "amount": details.get("amount", data.get("amount") or 0),
+            "currency": details.get("currency") or data.get("currency") or "RUB",
+            "payload": data.get("payload") or "",
+            "description": data.get("description") or "",
+            "paymentMethod": data.get("paymentMethod") or "",
+            "createdAt": data.get("createdAt") or data.get("created_at") or "",
+        }
+        return self._normalize(row)
+
     async def get_balances(self) -> list[dict[str, Any]]:
         data = await self._request("GET", "/balance/all")
         if isinstance(data, list):
@@ -282,7 +344,7 @@ class PlategaClient:
             kopecks = 0
         return PlategaTransaction(
             transaction_id=raw_id,
-            status=str(row.get("status") or "").upper(),
+            status=canonical_status(str(row.get("status") or "")),
             amount_kopecks=kopecks,
             currency=str(row.get("currencyCode") or row.get("currency") or "RUB"),
             payload=str(row.get("payload") or ""),

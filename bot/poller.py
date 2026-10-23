@@ -14,6 +14,7 @@ from bot.db import Database, IntegrityError, PaymentRecord, Promo
 from bot.notifications import notify_admin_sale, notify_admins, notify_chargeback, notify_sale
 from bot.platega import (
     INTERESTING_STATUSES,
+    STATUS_CANCELED,
     STATUS_CHARGEBACKED,
     STATUS_CONFIRMED,
     PlategaClient,
@@ -23,7 +24,8 @@ from bot.platega import (
     extract_promo_hint,
     match_known_promo,
 )
-from bot.utils import fmt_money, now_ts
+from bot.texts import render_admin_plain_sale
+from bot.utils import esc, fmt_money, now_ts
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +94,7 @@ class PlategaPoller:
 
         result.fetched = len(rows)
         known = [promo.code for promo in await self.db.list_promos()]
+        seen = {tx.transaction_id for tx in rows}
         for tx in rows:
             try:
                 await self._handle(tx, known, result)
@@ -99,22 +102,42 @@ class PlategaPoller:
                 log.exception("Не обработали транзакцию %s", tx.transaction_id)
                 result.errors.append(f"{tx.transaction_id}: {exc}")
 
+        await self._recheck_older_refunds(date_from, now, seen, known, result)
         await self.db.set_setting(CURSOR_KEY, now.isoformat())
         return result
 
     async def _window_start(self, now: datetime) -> datetime:
-        lookback = now - timedelta(hours=self.config.platega_lookback_hours)
-        raw = await self.db.get_setting(CURSOR_KEY)
-        if not raw:
-            return lookback
-        try:
-            cursor = datetime.fromisoformat(raw)
-            if cursor.tzinfo is None:
-                cursor = cursor.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return lookback
-        # небольшой нахлёст, чтобы не потерять границу интервала
-        return max(lookback, cursor - timedelta(minutes=30))
+        # Курсор нельзя сужать до последних минут: возврат меняет статус старой
+        # транзакции, а выгрузка фильтрует по дате создания, не по дате изменения.
+        return now - timedelta(hours=self.config.platega_lookback_hours)
+
+    async def _recheck_older_refunds(
+        self,
+        date_from: datetime,
+        now: datetime,
+        seen: set[str],
+        known: list[str],
+        result: SyncResult,
+    ) -> None:
+        """Возвраты старше окна выгрузки: спрашиваем статус у Platega точечно."""
+        older_than = int(date_from.timestamp())
+        newer_than = int((now - timedelta(days=30)).timestamp())
+        pending = await self.db.list_confirmed_with_sales(older_than, newer_than, limit=20)
+        for payment in pending:
+            if payment.transaction_id in seen:
+                continue
+            try:
+                fresh = await self.client.get_transaction(payment.transaction_id)
+            except PlategaError as exc:
+                result.errors.append(f"{payment.transaction_id}: {exc}")
+                continue
+            if fresh is None or fresh.status == STATUS_CONFIRMED:
+                continue
+            try:
+                await self._handle(fresh, known, result)
+            except Exception as exc:
+                log.exception("Не перепроверили транзакцию %s", payment.transaction_id)
+                result.errors.append(f"{payment.transaction_id}: {exc}")
 
     async def _handle(
         self, tx: PlategaTransaction, known_codes: list[str], result: SyncResult
@@ -144,8 +167,12 @@ class PlategaPoller:
         if tx.status == STATUS_CONFIRMED:
             await self._credit(payment, hint, existing, result)
             return
-        if tx.status == STATUS_CHARGEBACKED:
+        if tx.status == STATUS_CHARGEBACKED or (
+            tx.status == STATUS_CANCELED and existing is not None and existing.sale_id
+        ):
             await self._revert(payment, existing, result)
+            return
+        result.skipped += 1
 
     async def _credit(
         self,
@@ -163,12 +190,16 @@ class PlategaPoller:
 
         promo = await self._resolve_promo(hint)
         if promo is None:
-            if not hint:
+            already_told = (
+                previous is not None
+                and previous.status == STATUS_CONFIRMED
+                and previous.sale_id is None
+            )
+            if already_told:
                 result.skipped += 1
                 return
             result.unmatched += 1
-            if previous is None or previous.status != STATUS_CONFIRMED or previous.promo_id:
-                await self._notify_unmatched(payment, hint)
+            await self._notify_unmatched(payment, hint)
             return
 
         try:
@@ -217,14 +248,19 @@ class PlategaPoller:
         result: SyncResult,
     ) -> None:
         sale_id = payment.sale_id or (previous.sale_id if previous else None)
-        if previous and previous.status == STATUS_CHARGEBACKED and previous.sale_id is None:
+        linked_promo_id = payment.promo_id or (previous.promo_id if previous else None)
+        if sale_id is None:
+            linked = await self.db.get_active_sale_by_external_id(payment.transaction_id)
+            if linked is not None:
+                sale_id, linked_promo_id, _reward = linked
+        if previous and previous.status == STATUS_CHARGEBACKED and sale_id is None:
             result.skipped += 1
             return
 
         sale = await self.db.revert_sale(sale_id) if sale_id else None
         promo = None
-        if payment.promo_id:
-            promo = await self.db.get_promo_by_id(payment.promo_id)
+        if linked_promo_id:
+            promo = await self.db.get_promo_by_id(linked_promo_id)
         elif sale is None and payment.promo_code:
             promo = await self.db.get_promo_by_code(payment.promo_code)
 
@@ -246,8 +282,8 @@ class PlategaPoller:
             self.bot,
             self.config,
             (
-                f"↩️ Возврат Platega {payment.transaction_id}\n"
-                f"Промо: <code>{promo.code if promo else '—'}</code>\n"
+                f"↩️ Возврат Platega <code>{esc(payment.transaction_id)}</code>\n"
+                f"Промо: <code>{esc(promo.code) if promo else '—'}</code>\n"
                 f"Списано: {fmt_money(reward)}"
             ),
         )
@@ -261,15 +297,15 @@ class PlategaPoller:
         snippet = (payment.payload or payment.description or "").strip()
         if len(snippet) > 180:
             snippet = snippet[:177] + "…"
-        text = (
-            "❓ <b>Платёж Platega без известного промокода</b>\n\n"
-            f"ID: <code>{payment.transaction_id}</code>\n"
-            f"Сумма: {fmt_money(payment.amount)}\n"
-            f"Подсказка: <code>{hint or 'нет'}</code>\n"
+        text = render_admin_plain_sale(
+            extract_buyer_username(payment.payload, payment.description),
+            payment.created_at,
+            payment.amount,
+            hint,
+            payment.transaction_id,
+            snippet or None,
+            self.config.tz_offset_hours,
         )
-        if snippet:
-            text += f"Данные: <code>{snippet}</code>\n"
-        text += "\nПривяжите его вручную: панель → Неразобранные платежи."
         await notify_admins(self.bot, self.config, text)
 
 

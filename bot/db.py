@@ -672,6 +672,22 @@ class Database:
         record.is_reverted = True
         return record
 
+    async def get_active_sale_by_external_id(
+        self, external_id: str
+    ) -> tuple[int, int, int] | None:
+        """Живая продажа по id транзакции: (sale_id, promo_id, reward)."""
+        row = await self._one(
+            """
+            SELECT id, promo_id, reward
+              FROM sales
+             WHERE external_id = ? AND COALESCE(is_reverted, 0) = 0
+            """,
+            (external_id,),
+        )
+        if row is None:
+            return None
+        return int(row["id"]), int(row["promo_id"]), int(row["reward"])
+
     async def recent_sales(self, promo_id: int, limit: int = 10) -> list[SaleRecord]:
         rows = await self._all(
             f"""
@@ -997,6 +1013,24 @@ class Database:
              LIMIT ?
             """,
             (limit,),
+        )
+        return [PaymentRecord.from_row(row) for row in rows]
+
+    async def list_confirmed_with_sales(
+        self, created_before: int, created_after: int, limit: int = 20
+    ) -> list[PaymentRecord]:
+        """Оплаты со статусом CONFIRMED и уже записанной продажей, старше текущего окна выгрузки."""
+        rows = await self._all(
+            """
+            SELECT * FROM payments
+             WHERE status = 'CONFIRMED'
+               AND sale_id IS NOT NULL
+               AND created_at < ?
+               AND created_at > ?
+             ORDER BY created_at ASC
+             LIMIT ?
+            """,
+            (created_before, created_after, limit),
         )
         return [PaymentRecord.from_row(row) for row in rows]
 

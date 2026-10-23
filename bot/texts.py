@@ -101,7 +101,7 @@ def render_admin_sale_notification(
     reward: int,
     tz: int,
 ) -> str:
-    buyer_line = f"@{esc(buyer)}" if buyer else "не указан"
+    buyer_line = f"@{esc(str(buyer).lstrip('@'))}" if buyer else "не указан"
     lines = [
         "✅ <b>Оплата прошла</b>",
         "",
@@ -112,6 +112,39 @@ def render_admin_sale_notification(
     if amount:
         lines.append(f"Чек: {fmt_money(amount)}")
     lines.append(f"Начислено партнёру: <b>+{fmt_money(reward)}</b>")
+    return "\n".join(lines)
+
+
+def render_admin_plain_sale(
+    buyer: str | None,
+    when_ts: int | None,
+    amount: int | None,
+    hint: str | None,
+    transaction_id: str,
+    snippet: str | None,
+    tz: int,
+) -> str:
+    """Оплата, которую не удалось записать на промокод. Уходит всем админам."""
+    buyer_line = f"@{esc(str(buyer).lstrip('@'))}" if buyer else "не указан"
+    title = (
+        "❓ <b>Оплата с неизвестным промокодом</b>"
+        if hint
+        else "💳 <b>Оплата без промокода</b>"
+    )
+    lines = [
+        title,
+        "",
+        f"Покупатель: {buyer_line}",
+        f"Когда: {fmt_dt(when_ts, tz)}",
+    ]
+    if amount:
+        lines.append(f"Чек: {fmt_money(amount)}")
+    if hint:
+        lines.append(f"Подсказка: <code>{esc(hint)}</code>")
+    lines.append(f"ID: <code>{esc(transaction_id)}</code>")
+    if snippet:
+        lines.append(f"Данные: <code>{esc(snippet)}</code>")
+    lines.append("\nНа промокод не записано. Привязать: панель → Неразобранные платежи.")
     return "\n".join(lines)
 
 

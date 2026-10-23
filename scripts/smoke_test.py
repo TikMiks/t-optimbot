@@ -3,7 +3,12 @@ import tempfile
 from pathlib import Path
 
 from bot.db import Database, PromoCodeExists
-from bot.platega import extract_promo_hint, match_known_promo, rubles_to_kopecks
+from bot.platega import (
+    extract_buyer_username,
+    extract_promo_hint,
+    match_known_promo,
+    rubles_to_kopecks,
+)
 from bot.utils import fmt_money, normalize_code, parse_money
 
 
@@ -24,8 +29,17 @@ async def main() -> None:
     assert fmt_money(50000) == "500 ₽"
     assert fmt_money(123456) == "1 234,56 ₽"
     assert normalize_code(" neon15 ") == "NEON15"
+    assert normalize_code("@neon15") == "NEON15"
     assert extract_promo_hint('{"promo":"NEON15"}') == "NEON15"
+    assert extract_promo_hint("TG:@buyer", "по промокоду @MELL") == "MELL"
+    assert extract_promo_hint("@buyer", "HOLDIK") == "HOLDIK"
+    assert extract_promo_hint("TG:@buyer") is None
+    assert extract_buyer_username("TG:@Holdik") == "Holdik"
+    assert extract_buyer_username("Telegram: @holdik") == "holdik"
+    assert extract_buyer_username("@holdik_ceo") == "holdik_ceo"
     assert match_known_promo(["оплата neon15"], ["NEON15"]) == "NEON15"
+    assert match_known_promo(["TG:@mell оплата"], ["MELL"]) is None
+    assert match_known_promo(["TG:@mell по промокоду SONLAY"], ["MELL", "SONLAY"]) == "SONLAY"
     assert rubles_to_kopecks(1.15) == 115
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -38,6 +52,8 @@ async def main() -> None:
         await db.add_sale(promo.id, 50000, amount=450000, note="one")
         await db.add_sale(promo.id, 50000)
         await db.add_sale(promo.id, 50000, external_id="tx-1")
+        linked = await db.get_active_sale_by_external_id("tx-1")
+        assert linked is not None and linked[1] == promo.id
         stats = await db.promo_stats(promo.id)
         assert stats.sales_total == 3
         assert stats.earned == 150000
